@@ -1,0 +1,49 @@
+{
+  "duration_seconds": 46.93,
+  "exit_codes": {
+    "pytest": 0,
+    "tabs": 1,
+    "uat": 0
+  },
+  "finished_at": "2026-01-01T15:20:13.2372924-05:00",
+  "git_commit": "863c482fe7faee816e70bca3c176b39ca254a1ec",
+  "pytest_status": "PASS",
+  "started_at": "2026-01-01T15:19:26.3115070-05:00",
+  "tabs": {
+    "ACCOUNTS_TUNING": "OK",
+    "ADDBACKS": "OK",
+    "BILLING": "OK",
+    "DATA_INSPECTION": "OK",
+    "FORECAST": "FAIL: Found TAB_ERROR marker",
+    "KPI_EXPLORER": "OK",
+    "RECONCILIATION": "OK"
+  },
+  "tabs_status": "FAIL",
+  "uat_payload": {
+    "dashboard_metrics": {
+      "proj_net": 3253284.0911764717,
+      "proj_sde": 3452194.807058824,
+      "ytd_net": 1494752.1500000004,
+      "ytd_sde": 1586143.5600000003
+    },
+    "qb_pnl_metrics_report_window": {
+      "cogs": 3439867.52,
+      "net_profit": 1494752.1500000004,
+      "other_expense": 0.0,
+      "overhead": 742324.28,
+      "revenue": 5676943.95,
+      "sde": 1586143.5600000003
+    },
+    "reconciliation_bridge": {
+      "adjusted_net": 1494752.1500000004,
+      "legacy_overhead_included": 0.0,
+      "qb_net_start_plus": 1494752.1500000004
+    },
+    "run_rates": {
+      "monthly_net": 297362.86644199357,
+      "monthly_revenue": 1129359.3560661764,
+      "monthly_sde": 315544.08240196086
+    }
+  },
+  "uat_status": "PASS"
+}

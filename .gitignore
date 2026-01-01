@@ -1,0 +1,59 @@
+# Logs
+logs/
+*.log
+
+# Data exports / spreadsheets
+*.csv
+*.tsv
+*.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtualenv
+.venv/
+
+# Streamlit
+.streamlit/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Logs
+logs/
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Data exports / artifacts (do not commit real accounting exports)
+*.csv
+*.tsv
+*.xlsx
+*.xls
+
+# Images / screenshots
+*.png
+
+# Streamlit
+.streamlit/
+
+# Misc
+*.json
+
+# Allow sanitized UAT artifact
+!artifacts/uat_summary.json
+
+# Allow small, intentional fixtures if needed
+!tests/fixtures/**
+!tests/fixtures/**/*.csv
+!tests/fixtures/**/*.tsv

@@ -1,167 +1,209 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
-import numpy as np
-from src.utils import read_csv_flex, parse_money, normalize_dates, extract_account_code
+import re
 
-def load_ledger(file):
-    """
-    Loads the single ledger export (CSV or Excel).
-    Normalizes columns to canonical schema.
-    Smartly handles Excel sheets (skips empty 'Export Tips').
-    """
-    if file is None:
-        return None
 
-    # Custom Excel Loading Logic
-    if hasattr(file, "name") and (file.name.lower().endswith(".xlsx") or file.name.lower().endswith(".xls")):
+# Common date patterns seen in exports
+# - MM/DD/YYYY (optionally with a time suffix)
+# - YYYY-MM-DD (optionally with a time or "T" suffix)
+# - YYYY/MM/DD (optionally with a time suffix)
+_MDY_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}($|\s)")
+_YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}($|\s|T)")
+_YMD_SLASH_RE = re.compile(r"^\d{4}/\d{1,2}/\d{1,2}($|\s)")
+
+
+def parse_date_series(s: pd.Series) -> pd.Series:
+    """Parse mixed-format date strings into tz-naive pandas datetimes.
+
+    This avoids pandas falling back to slow/ambiguous dateutil inference.
+    Supports common QB exports:
+    - MM/DD/YYYY
+    - YYYY-MM-DD (optionally with a time suffix)
+    """
+    s_str = s.astype(str).str.strip()
+
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+    mdy = s_str.str.match(_MDY_RE)
+    if mdy.any():
+        # Strip any time component
+        out.loc[mdy] = pd.to_datetime(
+            s_str.loc[mdy].str.split().str[0],
+            format="%m/%d/%Y",
+            errors="coerce",
+        )
+
+    ymd = s_str.str.match(_YMD_RE)
+    if ymd.any():
+        # allow "YYYY-MM-DD ..." or "YYYY-MM-DDT..." by slicing first 10 chars
+        out.loc[ymd] = pd.to_datetime(
+            s_str.loc[ymd].str.slice(0, 10),
+            format="%Y-%m-%d",
+            errors="coerce",
+        )
+
+    ymd_slash = s_str.str.match(_YMD_SLASH_RE)
+    if ymd_slash.any():
+        out.loc[ymd_slash] = pd.to_datetime(
+            s_str.loc[ymd_slash].str.split().str[0],
+            format="%Y/%m/%d",
+            errors="coerce",
+        )
+
+    remaining = out.isna()
+    if remaining.any():
+        # Prefer pandas' mixed parser if available (avoids "Could not infer format" warning)
         try:
-            # Try standard Sheet1 first
-            df = pd.read_excel(file, sheet_name="Sheet1")
-        except Exception:
-            df = None
-            
-        # Fallback: Scan sheets if Sheet1 failed or is empty
-        if df is None or df.empty:
-            try:
-                xls = pd.ExcelFile(file)
-                for sheet in xls.sheet_names:
-                    # Skip known bad sheets
-                    if "tips" in sheet.lower():
-                        continue
-                        
-                    temp_df = pd.read_excel(file, sheet_name=sheet)
-                    # Check if it looks like data (has rows and maybe a Date column or similar)
-                    # We don't know exact col names yet, but check for non-empty
-                    if not temp_df.empty and len(temp_df.columns) > 3:
-                        df = temp_df
-                        break
-            except Exception:
-                pass
-                
-        if df is None:
-             # Final fallback to default
-             df = read_csv_flex(file)
-    else:
-        # CSV
-        df = read_csv_flex(file)
+            out.loc[remaining] = pd.to_datetime(s_str.loc[remaining], format="mixed", errors="coerce")
+        except TypeError:
+            out.loc[remaining] = pd.to_datetime(s_str.loc[remaining], errors="coerce")
 
-    if df is None:
-        return None
+    # Force tz-naive
+    try:
+        out = out.dt.tz_localize(None)
+    except Exception:
+        pass
 
+    return out
+
+def normalize_ledger_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    - Standardize column names (lowercase, underscores).
+    - Drop the 'unnamed: x' junk columns from the Excel export.
+    - Remove duplicate columns (keep the first occurrence).
+    """
     df = df.copy()
-    
-    # Handle potential header issues (e.g. report titles in first few rows)
-    # If columns are Ints, or don't contain "date", look for header
-    # Convert to string first to avoid AttributeError
-    cols_str = df.columns.astype(str).str.strip().str.lower()
-    
-    if not any("date" in c for c in cols_str):
-        # Try finding the header row
-        # Scan first 20 rows
-        for i, row in df.head(20).iterrows():
-            row_str = row.astype(str).str.strip().str.lower()
-            # Look for "date" AND ("account" OR "amount" OR "debit" OR "credit" OR "type")
-            has_date = row_str.str.contains("date", case=False).any()
-            has_other = row_str.str.contains("account|amount|debit|credit|type|name", regex=True, case=False).any()
-            
-            if has_date and has_other:
-                # Found header at index i
-                # Reload with header at i+1 (since 0-indexed, but read_csv header param is 0-based row index)
-                # Actually, we can just set columns and slice
-                df.columns = row.astype(str).str.strip().str.lower()
-                df = df.iloc[i+1:].reset_index(drop=True)
+
+    # 1) Normalize names: strip + lowercase + spaces -> underscores
+    df.columns = [
+        str(c).strip().lower().replace(" ", "_")
+        for c in df.columns
+    ]
+
+    # 2) Drop the 'unnamed: x' noise columns, and explicit 'nan' strings
+    keep_cols = [
+        c for c in df.columns 
+        if not c.startswith("unnamed") and c != "nan" and c != ""
+    ]
+    df = df[keep_cols].copy()
+
+    # 3) Drop duplicate column names (keep the first occurrence)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    return df
+
+def load_ledger(uploaded_file: Any) -> pd.DataFrame:
+    """
+    Load a QuickBooks CSV/XLSX ledger export and normalize it into a usable
+    transaction table.
+
+    This version is robust to QB exports where the *first* row is not the real
+    header (e.g. it contains sample data or a funky title row). It:
+
+    - Reads the file with header=None.
+    - Scans the first ~20 rows for a row containing both 'Date' and 'Account'.
+    - Uses that row as the header.
+    - Drops rows above the header.
+    - Normalizes column names.
+    - Ensures we have: date, account, account_type, name, memo, amount.
+    """
+    name = getattr(uploaded_file, "name", "ledger").lower()
+    suffix = Path(name).suffix
+
+    # 1) Read raw file, no header
+    if suffix == ".csv":
+        # Try encodings
+        encodings = ["utf-8", "cp1252", "latin1"]
+        raw = None
+        for enc in encodings:
+            try:
+                uploaded_file.seek(0)
+                raw = pd.read_csv(uploaded_file, header=None, dtype=str, encoding=enc, sep=',', engine='python', on_bad_lines='skip')
                 break
-    else:
-        df.columns = cols_str
-
-    # Rename map based on "Transaction Detail by Account" or "Custom Detail Transaction Report"
-    # Typical QB export columns: Date, Type, Num, Name, Memo, Account, Clr, Split, Amount, Balance
-    # Sometimes "Debit", "Credit" instead of Amount.
-    # "Account Type" might be present if customized, or we might need to infer it? 
-    # Prompt says "Account Type" is a column.
-    
-    # Map (target_col: [list of possible source cols])
-    map_rules = {
-        "date": ["date", "trans date", "transaction date", "txn date"],
-        "txn_type": ["type", "transaction type", "txn type"],
-        "num": ["num", "ref", "reference", "no."],
-        "name": ["name", "source name", "payee", "name address"],
-        "memo": ["memo", "description"],
-        "account": ["account"],
-        "account_type": ["account type", "type of account", "acct type"],
-        "class": ["class"],
-        "debit": ["debit"],
-        "credit": ["credit"],
-        "amount": ["amount", "balance", "total"] # Balance is usually running balance, but sometimes used as amount? Be careful.
-        # Actually "Amount" is standard. "Balance" is usually not what we want (running total).
-    }
-    
-    # Flatten to source -> target
-    col_map = {}
-    for target, sources in map_rules.items():
-        for s in sources:
-            col_map[s] = target
-            
-    # Apply renaming if columns exist
-    new_cols = {}
-    for col in df.columns:
-        col_clean = col.strip().lower()
-        # Direct match (already canonical)
-        if col_clean in map_rules.keys():
-            continue
-        # Dictionary match
-        if col_clean in col_map:
-            new_cols[col] = col_map[col_clean]
-            
-    df.rename(columns=new_cols, inplace=True)
-    
-    # Special case: If 'amount' missing, but 'debit'/'credit' missing too, check for 'amount' aliases again carefully?
-    # The loop above handles it.
-    
-    df.rename(columns=new_cols, inplace=True)
-    
-    # Deduplicate columns (keep first)
-    df = df.loc[:, ~df.columns.duplicated()]
-    
-    # Ensure required columns exist (fill missing with None/NaN)
-    required_cols = ["date", "txn_type", "num", "name", "memo", "account", "account_type", "class", "debit", "credit", "amount"]
-    for c in required_cols:
-        if c not in df.columns:
-            df[c] = np.nan
-            
-    # Normalize Date
-    df["date"] = normalize_dates(df["date"])
-    
-    # Force datetime64[ns] to satisfy PyArrow
-    # Errors='coerce' here again just to be safe against any leftover objects
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    
-    # Filter rows with invalid dates (e.g. blank lines, total rows)
-    df = df.dropna(subset=["date"])
-    
-    # Normalize Money
-    for c in ["amount", "debit", "credit"]:
-        df[c] = parse_money(df[c])
+            except UnicodeDecodeError:
+                continue
         
-    # If Amount is missing but Debit/Credit present
-    # QB Logic: Debit is usually positive in expense, Credit positive in income?
-    # Or simply Amount = Debit - Credit?
-    # Prompt says: "In this ledger, income lines often have negative amount (credits). Define revenue_amount = -amount"
-    # So we assume 'amount' column exists or we calculate it. 
-    # Usually QB export has 'Amount' (signed).
-    
-    if df["amount"].isna().all() and (not df["debit"].isna().all() or not df["credit"].isna().all()):
-        df["debit"] = df["debit"].fillna(0)
-        df["credit"] = df["credit"].fillna(0)
-        # Standard Accounting: Asset/Exp Debit+, Liab/Eq/Inc Credit+
-        # But in a transaction report, "Amount" column is usually signed from perspective of the account?
-        # Let's assume Amount is provided or calculated as Debit - Credit (standard generic approach)
-        df["amount"] = df["debit"] - df["credit"]
+        if raw is None:
+             # If all else fails, try one last time with error replacement
+             uploaded_file.seek(0)
+             raw = pd.read_csv(uploaded_file, header=None, dtype=str, encoding="utf-8", encoding_errors="replace", sep=',', engine='python', on_bad_lines='skip')
 
-    # Fill strings
-    for c in ["txn_type", "name", "memo", "account", "account_type", "class"]:
-        df[c] = df[c].fillna("").astype(str)
+    elif suffix in {".xlsx", ".xls"}:
+        raw = pd.read_excel(uploaded_file, sheet_name=0, header=None, dtype=str)
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}")
 
-    # Extract Account Code
-    df["acct_code"] = df["account"].apply(extract_account_code)
+    # 2) Find the header row: a row containing 'date' and 'account'
+    header_row_idx = None
+    for i in range(min(30, len(raw))):
+        row_vals = raw.iloc[i].astype(str).str.strip().str.lower()
+        if ("date" in row_vals.values) and ("account" in row_vals.values):
+            header_row_idx = i
+            break
+
+    if header_row_idx is None:
+        # Fallback: assume first row is header
+        header = raw.iloc[0]
+        df = raw.iloc[1:].copy()
+    else:
+        header = raw.iloc[header_row_idx]
+        df = raw.iloc[header_row_idx + 1 :].copy()
+
+    # 3) Apply header
+    df.columns = header
+
+    # 4) Normalize column names using our helper (this drops junk columns)
+    df = normalize_ledger_columns(df)
+
+    # 5) Drop fully empty rows (now that junk columns are gone)
+    df = df.dropna(how="all")
+
+    # 6) Pick a date column
+    date_col = None
+    for cand in ("date", "txn_date", "transaction_date", "posting_date"):
+        if cand in df.columns:
+            date_col = cand
+            break
+
+    if date_col:
+        df["date"] = parse_date_series(df[date_col])
+    else:
+        df["date"] = pd.NaT
+
+    # Drop rows with no valid date
+    df = df.dropna(subset=["date"])
+
+    # 7) Ensure numeric amount
+    def clean_num(x):
+        if isinstance(x, str):
+            return x.replace(",", "").replace("$", "").strip()
+        return x
+
+    if "amount" in df.columns:
+        # Clean commas if present
+        df["amount"] = df["amount"].apply(clean_num)
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    else:
+        # Clean commas from debit/credit columns
+        raw_debit = df.get("debit", pd.Series(dtype=str))
+        if hasattr(raw_debit, "apply"):
+             raw_debit = raw_debit.apply(clean_num)
+        
+        raw_credit = df.get("credit", pd.Series(dtype=str))
+        if hasattr(raw_credit, "apply"):
+             raw_credit = raw_credit.apply(clean_num)
+
+        debit = pd.to_numeric(raw_debit, errors="coerce").fillna(0.0)
+        credit = pd.to_numeric(raw_credit, errors="coerce").fillna(0.0)
+        df["amount"] = debit - credit
+
+    # 8) Ensure required text columns exist
+    for col in ("account", "account_type", "name", "memo"):
+        if col not in df.columns:
+            df[col] = ""
 
     return df
