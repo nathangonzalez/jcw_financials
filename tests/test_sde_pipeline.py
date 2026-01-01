@@ -149,12 +149,13 @@ def test_legacy_cogs_excluded_from_owner_metrics():
     # Legacy COGS: 100,000 (July only)
     assert round(legacy_cogs, 2) == 100000.0
 
-    # Overhead: 50,000 (July+)
-    assert round(overhead, 2) == 50000.0
+    # Overhead (core P&L): Aug+ only (there is no Aug overhead in this fixture)
+    assert round(overhead, 2) == 0.0
+    assert round(metrics.get("legacy_july_included_overhead", 0.0), 2) == 50000.0
 
     # Net Profit = revenue - (owner COGS + overhead)
-    #            = 500,000 - (200,000 + 50,000) = 250,000
-    assert round(net_profit, 2) == 250000.0
+    #            = 500,000 - (200,000 + 0) = 300,000
+    assert round(net_profit, 2) == 300000.0
 
 
 def test_legacy_july_job_cost_prefix_excluded_but_overhead_included():
@@ -202,8 +203,9 @@ def test_legacy_july_job_cost_prefix_excluded_but_overhead_included():
     # Aug+ expenses still included
     # Note: 705.* is treated as COGS via account prefix classification.
     assert metrics["cogs"] == 700.0
-    assert metrics["overhead"] == 500.0 + 400.0  # July rent + Aug rent
+    # Core overhead includes Aug+ only; July rent is tracked separately
+    assert metrics["overhead"] == 400.0
     assert metrics["revenue"] == 3000.0
 
-    # Net profit = 3000 - (cogs(0) + overhead(1600) + other(50)) = 1350
-    assert metrics["net_profit"] == 1350.0
+    # Net profit = 3000 - (cogs(700) + overhead(400) + other(50)) = 1850
+    assert metrics["net_profit"] == 1850.0

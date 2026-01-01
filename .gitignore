@@ -16,6 +16,9 @@ __pycache__/
 
 # Streamlit
 .streamlit/
+
+# Local rule/config data (not committed)
+data/addback_rules.json
 # Python
 __pycache__/
 *.py[cod]

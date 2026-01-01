@@ -3,6 +3,57 @@ import numpy as np
 import re
 
 
+def is_pnl_account_type(account_type: str) -> bool:
+    """Return True if an account_type looks like a P&L account type.
+
+    QuickBooks exports typically use account_type values like:
+    - Income
+    - Cost of Goods Sold
+    - Expense
+    - Other Income
+    - Other Expense
+
+    Balance sheet types we explicitly exclude include:
+    - Bank, Accounts Payable, Accounts Receivable, Credit Card
+    - Fixed Asset, Other Current Asset, Other Current Liability
+    - Long Term Liability, Equity
+
+    If account_type is missing/blank, we treat it as P&L (best-effort) to avoid
+    dropping valid rows from imperfect exports.
+    """
+    if account_type is None:
+        return True
+    s = str(account_type).strip().lower()
+    if s in {"", "nan"}:
+        return True
+
+    # Explicit balance sheet categories
+    balance_sheet_tokens = [
+        "bank",
+        "accounts payable",
+        "accounts receivable",
+        "credit card",
+        "fixed asset",
+        "other current asset",
+        "other current liability",
+        "long term liability",
+        "equity",
+    ]
+    if any(t in s for t in balance_sheet_tokens):
+        return False
+
+    # Explicit P&L categories
+    pnl_tokens = [
+        "income",
+        "expense",
+        "cost of goods sold",
+        "cogs",
+        "other income",
+        "other expense",
+    ]
+    return any(t in s for t in pnl_tokens)
+
+
 def _net_to_positive(total: float) -> float:
     """Convert a signed net total into a positive magnitude.
 
@@ -71,6 +122,9 @@ def classify_transactions(df: pd.DataFrame, cogs_prefixes: set[str] | None = Non
         else pd.Series([""] * len(df), index=df.index)
     ).astype(str).str.lower().fillna("")
 
+    # Mark P&L vs balance-sheet rows
+    df["is_pnl"] = atype.map(is_pnl_account_type)
+
     account_series = (
         df["account"]
         if "account" in df.columns
@@ -87,15 +141,15 @@ def classify_transactions(df: pd.DataFrame, cogs_prefixes: set[str] | None = Non
     df["is_other_expense"] = False
 
     # Revenue
-    revenue_mask = atype.str.contains("income") | account_lower.str.contains("income")
+    revenue_mask = df["is_pnl"] & (atype.str.contains("income") | account_lower.str.contains("income"))
     df.loc[revenue_mask, "is_revenue"] = True
 
     # Other expense / other income (do not mark as overhead)
-    other_exp_mask = atype.str.contains("other expense") | atype.str.contains("other income")
+    other_exp_mask = df["is_pnl"] & (atype.str.contains("other expense") | atype.str.contains("other income"))
     df.loc[other_exp_mask & (~revenue_mask), "is_other_expense"] = True
 
     # Expense-like rows (expense/cogs) that are not already classified
-    expense_like = atype.str.contains("expense") | atype.str.contains("cost of goods sold") | atype.str.contains("cogs")
+    expense_like = df["is_pnl"] & (atype.str.contains("expense") | atype.str.contains("cost of goods sold") | atype.str.contains("cogs"))
     remaining = expense_like & (~df["is_revenue"]) & (~df["is_other_expense"])
 
     # COGS:
@@ -124,12 +178,12 @@ def classify_transactions(df: pd.DataFrame, cogs_prefixes: set[str] | None = Non
             df["is_other_expense"],
         ],
         ["Revenue", "COGS", "Overhead", "Other"],
-        default=np.where(atype.eq(""), "Unclassified", "Other"),
+        default=np.where(df["is_pnl"] & atype.eq(""), "Unclassified", np.where(df["is_pnl"], "Other", "Balance Sheet")),
     )
 
     return df
 
-def detect_addbacks(df: pd.DataFrame, custom_tokens=None) -> pd.DataFrame:
+def detect_addbacks(df: pd.DataFrame, custom_tokens=None, rules=None) -> pd.DataFrame:
     df = df.copy()
     if custom_tokens is None:
         custom_tokens = []
@@ -172,6 +226,14 @@ def detect_addbacks(df: pd.DataFrame, custom_tokens=None) -> pd.DataFrame:
         existing_reasons = df.loc[hit, "sde_addback_reason"]
         new_reasons = existing_reasons + (existing_reasons.apply(lambda x: ", " if x else "") + f"token={t}")
         df.loc[hit, "sde_addback_reason"] = new_reasons
+
+    # Optional rule engine (e.g. local JSON rules)
+    if rules:
+        try:
+            df = apply_addback_rules(df, rules)
+        except Exception:
+            # Rules are optional; never hard-fail core processing.
+            pass
 
     return df
 
@@ -233,9 +295,9 @@ def get_owner_metrics(
     cogs = _net_to_positive(cogs_raw)
     legacy_cogs = _net_to_positive(legacy_cogs_raw)
 
-    # Overhead:
-    # - Aug+ overhead: include all
-    # - July overhead: include only non-job-cost overhead if exclusion enabled
+    # Overhead (core P&L):
+    # - Include ONLY rows on/after owner_revenue_start.
+    # - July overhead is handled as an optional add-in (selected transactions) via apply_legacy_overhead_addins.
     overhead_aug_raw = df_window.loc[df_window["is_overhead"] & aug_plus_mask, "amount"].sum()
 
     if exclude_legacy_july_job_costs:
@@ -246,17 +308,17 @@ def get_owner_metrics(
     legacy_july_included_overhead_raw = df_window.loc[july_overhead_mask, "amount"].sum()
     legacy_july_included_overhead = _net_to_positive(legacy_july_included_overhead_raw)
 
-    overhead_raw = overhead_aug_raw + legacy_july_included_overhead_raw
+    overhead_raw = overhead_aug_raw
 
     # Other Expense:
-    # Spec: July legacy window includes overhead only, so exclude July other_expense.
+    # Core P&L includes only Aug+.
     other_expense_raw = df_window.loc[df_window["is_other_expense"] & aug_plus_mask, "amount"].sum()
 
     overhead = _net_to_positive(overhead_raw)
     other_expense = _net_to_positive(other_expense_raw)
 
     # 4. Addbacks
-    # Start with token-based flags
+    # Start with token-based flags (and optional external rule engine)
     addback_mask = df_window.get("sde_addback_flag", pd.Series([False] * len(df_window))).copy()
     # Add account-level overrides
     if addback_account_overrides:
@@ -295,11 +357,26 @@ def get_owner_metrics(
     }
 
 
+def apply_addback_rules(df: pd.DataFrame, rules: list[dict] | None = None) -> pd.DataFrame:
+    """Apply JSON-defined addback rules to a ledger dataframe.
+
+    This is a thin wrapper around src.addback_rules to keep app/business_logic imports stable.
+    """
+    if not rules:
+        return df
+
+    from src.addback_rules import parse_rule, apply_rules_to_df
+
+    parsed = [parse_rule(r) for r in rules if isinstance(r, dict)]
+    return apply_rules_to_df(df, parsed)
+
+
 def compute_legacy_overhead_addins(
     df: pd.DataFrame,
     legacy_start,
     legacy_end,
     included_accounts: set[str] | None = None,
+    included_row_ids: set[str] | None = None,
 ) -> float:
     """Compute prior-period overhead to include as an add-in.
 
@@ -327,6 +404,11 @@ def compute_legacy_overhead_addins(
     mask = (d["date"].dt.date >= legacy_start) & (d["date"].dt.date <= legacy_end) & (d["is_overhead"])
     if included_accounts:
         mask = mask & d.get("account", pd.Series([""] * len(d), index=d.index)).astype(str).isin(included_accounts)
+
+    if included_row_ids:
+        # Prefer explicit transaction selection when available
+        rid = d.get("_row_id", pd.Series(["" for _ in range(len(d))], index=d.index)).astype(str)
+        mask = mask & rid.isin(included_row_ids)
 
     legacy_overhead_raw = d.loc[mask, "amount"].sum()
     return float(_net_to_positive(legacy_overhead_raw))

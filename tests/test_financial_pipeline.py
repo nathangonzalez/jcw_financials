@@ -63,21 +63,23 @@ def test_pipeline(sample_ledger):
     assert metrics["cogs"] == 600.0
     assert metrics["legacy_cogs"] == 500.0
     
-    # Overhead: July Rent (-1000) + Aug Utils (-200) + Owner Salary (-3000) = -4200 -> Positive 4200
-    assert metrics["overhead"] == 4200.0
+    # Overhead (core P&L): Aug Utils (-200) + Owner Salary (-3000) = -3200 -> Positive 3200
+    # July overhead is tracked separately for optional add-in handling.
+    assert metrics["overhead"] == 3200.0
+    assert metrics["legacy_july_included_overhead"] == 1000.0
     
     # Other Expense: Aug Interest (-50) -> Positive 50
     assert metrics["other_expense"] == 50.0
     
     # Net Profit: Rev - (COGS + Overhead + Other)
-    # 2000 - (600 + 4200 + 50) = 2000 - 4850 = -2850
-    assert metrics["net_profit"] == -2850.0
+    # 2000 - (600 + 3200 + 50) = 2000 - 3850 = -1850
+    assert metrics["net_profit"] == -1850.0
     
     # Addbacks: Owner Salary (-3000) -> Positive 3000
     assert metrics["addbacks"] == 3000.0
     
-    # SDE: Net Profit + Addbacks = -2850 + 3000 = 150
-    assert metrics["sde"] == 150.0
+    # SDE: Net Profit + Addbacks = -1850 + 3000 = 1150
+    assert metrics["sde"] == 1150.0
     
     # 4. Period Metrics (Run Rate Basis: Aug 1 - Aug 31)
     # Filter df first
@@ -117,7 +119,7 @@ def test_pipeline(sample_ledger):
     assert abs(forecast["revenue"] - (2000 + rem_rev)) < 0.01
     
     # SDE Forecast
-    # YTD SDE (150) + Rem SDE
+    # YTD SDE (1150) + Rem SDE
     # Rem SDE = (1150 / 31) * 304
     rem_sde = (1150 / 31) * 304
-    assert abs(forecast["sde"] - (150 + rem_sde)) < 0.01
+    assert abs(forecast["sde"] - (1150 + rem_sde)) < 0.01

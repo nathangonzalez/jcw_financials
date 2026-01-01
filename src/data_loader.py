@@ -206,4 +206,8 @@ def load_ledger(uploaded_file: Any) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
 
+    # Stable row id for UI selection / reconciliation
+    # (kept as string to avoid Arrow dtype edge cases)
+    df["_row_id"] = pd.Series(range(len(df)), index=df.index).astype(str)
+
     return df
